@@ -4,21 +4,31 @@ from torch.nn.functional import softmax
 import re
 
 class PromptGuard:
-    def __init__(self, model_name="meta-llama/Prompt-Guard-86M"):
+    def __init__(self, model_name="meta-llama/Llama-Prompt-Guard-2-86M"):
         """
-        Initialize Meta's Prompt Guard model.
+        Initialize Meta's Prompt Guard 2 model.
+        
+        Note: Prompt Guard 2 uses binary classification (BENIGN/MALICIOUS)
+        instead of the three-class system (BENIGN/INJECTION/JAILBREAK) from v1.
         """
-        print("   Loading Prompt Guard model...")
+        print("   Loading Prompt Guard 2 model...")
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
             self.model.eval()
-            print("   Prompt Guard loaded successfully!")
+            print("   Prompt Guard 2 loaded successfully!")
+            
+            # Prompt Guard 2 uses binary classification
+            # id2label: {0: "BENIGN", 1: "MALICIOUS"}
+            self.labels = self.model.config.id2label
+            print(f"   Model labels: {self.labels}")
+            
         except Exception as e:
-            print(f"   Warning: Could not load Prompt Guard: {e}")
+            print(f"   Warning: Could not load Prompt Guard 2: {e}")
             print("   Continuing without Prompt Guard...")
             self.model = None
             self.tokenizer = None
+            self.labels = None
     
     def has_instruction_patterns(self, text: str) -> bool:
         """
@@ -50,14 +60,19 @@ class PromptGuard:
         
         return False
     
-    def check_prompt(self, text: str, threshold: float = 0.85) -> dict:
+    def check_prompt(self, text: str, threshold: float = 0.5) -> dict:
         """
-        Multi-layered prompt injection detection.
+        Multi-layered prompt injection detection using Prompt Guard 2.
         
         Strategy:
         1. First check for obvious manipulation patterns (fast, no false positives)
-        2. If suspicious, use Prompt Guard ML model (slower, some false positives)
-        3. Only block if BOTH agree it's dangerous
+        2. If suspicious, use Prompt Guard 2 ML model (binary classification)
+        3. Only block if BOTH agree it's dangerous OR ML has very high confidence
+        
+        Args:
+            text: The input text to check
+            threshold: Confidence threshold for malicious classification (0.0-1.0)
+                      Default 0.5 provides balanced detection
         """
         
         # Layer 1: Pattern-based detection (catches obvious attacks)
@@ -68,10 +83,10 @@ class PromptGuard:
             if has_suspicious_pattern:
                 return {
                     "is_safe": False,
-                    "label": "INJECTION",
+                    "label": "MALICIOUS",
                     "score": 1.0,
                     "detection_method": "pattern_matching",
-                    "probabilities": {"benign": 0.0, "injection": 1.0, "jailbreak": 0.0},
+                    "probabilities": {"benign": 0.0, "malicious": 1.0},
                     "message": "Suspicious instruction pattern detected"
                 }
             return {
@@ -79,12 +94,12 @@ class PromptGuard:
                 "label": "BENIGN",
                 "score": 0.0,
                 "detection_method": "pattern_matching",
-                "probabilities": {"benign": 1.0, "injection": 0.0, "jailbreak": 0.0},
+                "probabilities": {"benign": 1.0, "malicious": 0.0},
                 "message": "Query appears safe"
             }
         
         try:
-            # Layer 2: ML-based detection
+            # Layer 2: ML-based detection with Prompt Guard 2
             inputs = self.tokenizer(
                 text,
                 return_tensors="pt",
@@ -98,31 +113,29 @@ class PromptGuard:
             
             probabilities = softmax(logits, dim=-1)[0]
             
-            # Get scores for each category
+            # Prompt Guard 2 uses binary classification
+            # Index 0: BENIGN, Index 1: MALICIOUS
             benign_score = probabilities[0].item()
-            injection_score = probabilities[1].item()
-            jailbreak_score = probabilities[2].item()
+            malicious_score = probabilities[1].item()
             
             # Determine predicted class
             predicted_class = torch.argmax(probabilities).item()
-            labels = ["BENIGN", "INJECTION", "JAILBREAK"]
-            predicted_label = labels[predicted_class]
+            predicted_label = self.labels[predicted_class]
             
             # Multi-layered decision logic:
-            # Block only if BOTH pattern matching AND ML model agree
-            ml_flags_as_unsafe = (jailbreak_score > threshold)
+            # Block if BOTH pattern matching AND ML model agree, OR if ML has very high confidence
+            ml_flags_as_unsafe = (malicious_score > threshold)
             
             if has_suspicious_pattern and ml_flags_as_unsafe:
                 # Both agree - high confidence block
                 return {
                     "is_safe": False,
                     "label": predicted_label,
-                    "score": jailbreak_score,
+                    "score": malicious_score,
                     "detection_method": "pattern_and_ml",
                     "probabilities": {
                         "benign": benign_score,
-                        "injection": injection_score,
-                        "jailbreak": jailbreak_score
+                        "malicious": malicious_score
                     },
                     "message": "High-confidence prompt injection detected"
                 }
@@ -135,24 +148,23 @@ class PromptGuard:
                     "detection_method": "pattern_only",
                     "probabilities": {
                         "benign": benign_score,
-                        "injection": injection_score,
-                        "jailbreak": jailbreak_score
+                        "malicious": malicious_score
                     },
                     "message": "Suspicious pattern detected but ML model says benign - allowing"
                 }
-            elif ml_flags_as_unsafe and jailbreak_score > 0.95:
+            elif ml_flags_as_unsafe and malicious_score > 0.85:
                 # ML very confident even without pattern - block
+                # Using 0.85 threshold for high-confidence blocking without pattern match
                 return {
                     "is_safe": False,
                     "label": predicted_label,
-                    "score": jailbreak_score,
+                    "score": malicious_score,
                     "detection_method": "ml_high_confidence",
                     "probabilities": {
                         "benign": benign_score,
-                        "injection": injection_score,
-                        "jailbreak": jailbreak_score
+                        "malicious": malicious_score
                     },
-                    "message": "Very high ML confidence of jailbreak"
+                    "message": "Very high ML confidence of malicious prompt"
                 }
             else:
                 # Safe
@@ -163,22 +175,21 @@ class PromptGuard:
                     "detection_method": "ml",
                     "probabilities": {
                         "benign": benign_score,
-                        "injection": injection_score,
-                        "jailbreak": jailbreak_score
+                        "malicious": malicious_score
                     },
                     "message": "Query appears safe"
                 }
             
         except Exception as e:
-            print(f"   Error in Prompt Guard check: {e}")
+            print(f"   Error in Prompt Guard 2 check: {e}")
             # On error, fall back to pattern matching
             if has_suspicious_pattern:
                 return {
                     "is_safe": False,
-                    "label": "INJECTION",
+                    "label": "MALICIOUS",
                     "score": 1.0,
                     "detection_method": "pattern_fallback",
-                    "probabilities": {"benign": 0.0, "injection": 1.0, "jailbreak": 0.0},
+                    "probabilities": {"benign": 0.0, "malicious": 1.0},
                     "message": "Error in ML check, blocked by pattern matching"
                 }
             return {
@@ -186,7 +197,7 @@ class PromptGuard:
                 "label": "ERROR",
                 "score": 0.0,
                 "detection_method": "error",
-                "probabilities": {"benign": 0.0, "injection": 0.0, "jailbreak": 0.0},
+                "probabilities": {"benign": 0.0, "malicious": 0.0},
                 "message": "Error during check but no suspicious patterns found"
             }
 
@@ -198,127 +209,3 @@ def get_prompt_guard():
     if _prompt_guard_instance is None:
         _prompt_guard_instance = PromptGuard()
     return _prompt_guard_instance
-
-
-# from transformers import AutoTokenizer, AutoModelForSequenceClassification
-# import torch
-
-# class PromptGuard:
-#     def __init__(self, model_name="meta-llama/Prompt-Guard-86M"):
-#         """
-#         Initialize Meta's Prompt Guard model.
-#         Model will be downloaded on first use and cached locally.
-#         """
-#         print("   Loading Prompt Guard model (this may take a moment on first run)...")
-#         try:
-#             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-#             self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
-#             self.model.eval()  # Set to evaluation mode
-#             print("   Prompt Guard model loaded successfully!")
-#         except Exception as e:
-#             print(f"   Warning: Could not load Prompt Guard model: {e}")
-#             print("   Continuing without Prompt Guard protection...")
-#             self.model = None
-#             self.tokenizer = None
-        
-#     def check_prompt(self, text: str, threshold: float = 0.75) -> dict:
-#         """
-#         Check if a prompt contains injection or jailbreak attempts.
-        
-#         Args:
-#             text: The user's query text
-#             threshold: Confidence threshold (0-1) for flagging prompts
-            
-#         Returns:
-#             dict with keys:
-#                 - is_safe: bool indicating if prompt is safe
-#                 - label: classification label (BENIGN, INJECTION, or JAILBREAK)
-#                 - score: confidence score
-#                 - probabilities: dict of all class probabilities
-#                 - message: human-readable message
-#         """
-#         # If model failed to load, default to safe
-#         if self.model is None or self.tokenizer is None:
-#             return {
-#                 "is_safe": True,
-#                 "label": "BENIGN",
-#                 "score": 1.0,
-#                 "probabilities": {"benign": 1.0, "injection": 0.0, "jailbreak": 0.0},
-#                 "message": "Prompt Guard not available - defaulting to safe"
-#             }
-        
-#         try:
-#             # Tokenize input
-#             inputs = self.tokenizer(
-#                 text, 
-#                 return_tensors="pt", 
-#                 truncation=True, 
-#                 max_length=512,
-#                 padding=True
-#             )
-            
-#             # Get model predictions
-#             with torch.no_grad():
-#                 outputs = self.model(**inputs)
-#                 logits = outputs.logits
-#                 probabilities = torch.softmax(logits, dim=-1)[0]
-            
-#             # Get predicted class
-#             predicted_class = torch.argmax(probabilities).item()
-#             confidence = probabilities[predicted_class].item()
-            
-#             # Map class indices to labels
-#             # 0: BENIGN, 1: INJECTION, 2: JAILBREAK
-#             labels = ["BENIGN", "INJECTION", "JAILBREAK"]
-#             predicted_label = labels[predicted_class]
-            
-#             # Determine if prompt is safe
-#             is_safe = predicted_label == "BENIGN" and confidence > threshold
-            
-#             # Create response
-#             result = {
-#                 "is_safe": is_safe,
-#                 "label": predicted_label,
-#                 "score": confidence,
-#                 "probabilities": {
-#                     "benign": probabilities[0].item(),
-#                     "injection": probabilities[1].item(),
-#                     "jailbreak": probabilities[2].item()
-#                 }
-#             }
-            
-#             # Add human-readable message
-#             if is_safe:
-#                 result["message"] = "Query appears safe."
-#             elif predicted_label == "INJECTION":
-#                 result["message"] = "Potential prompt injection detected."
-#             else:
-#                 result["message"] = "Potential jailbreak attempt detected."
-            
-#             return result
-            
-#         except Exception as e:
-#             print(f"   Error in Prompt Guard check: {e}")
-#             # Fail safe - flag as potentially unsafe on error
-#             return {
-#                 "is_safe": False,
-#                 "label": "ERROR",
-#                 "score": 0.0,
-#                 "probabilities": {"benign": 0.0, "injection": 0.0, "jailbreak": 0.0},
-#                 "message": f"Error during safety check: {str(e)}"
-#             }
-
-# # Create a singleton instance
-# _prompt_guard_instance = None
-
-# def get_prompt_guard():
-#     """
-#     Get or create the PromptGuard instance (singleton pattern).
-#     This ensures the model is only loaded once.
-#     """
-#     global _prompt_guard_instance
-#     if _prompt_guard_instance is None:
-#         _prompt_guard_instance = PromptGuard()
-#     return _prompt_guard_instance
-
-
