@@ -322,10 +322,25 @@ def query_rag(query_text: str, use_guard: bool = True, use_prompt_guard: bool = 
         return response
     
     # Filter results by relevance threshold
-    RELEVANCE_THRESHOLD = 0.3
+    RELEVANCE_THRESHOLD = 0.15
     filtered_results = [(doc, score) for doc, score in results if (1 - score) >= RELEVANCE_THRESHOLD]
     
     if not filtered_results:
+        # Display retrieved chunks
+        #TODO: Replace with function to print top chunks
+        print("\n📄 Retrieved Context Chunks:")
+        print("-" * 60)
+        for i, (doc, score) in enumerate(results, 1):
+            print(f"\n[Chunk {i}] Source: {doc.metadata.get('id', 'Unknown')}")
+            print(f"Relevance Score: {1-score:.3f}")
+            print(f"Content Preview ({len(doc.page_content)} chars):")
+            print("-" * 60)
+            # Show first 300 characters of each chunk
+            preview = doc.page_content[:300].strip()
+            if len(doc.page_content) > 300:
+                preview += "..."
+            print(preview)
+            print("-" * 60)
         print(f"\n⚠️  No relevant chunks found (all below {RELEVANCE_THRESHOLD} relevance threshold)")
         print(f"   Best match was only {(1-results[0][1]):.2f} relevant")
         response = "I cannot answer this question based on the available documents."
@@ -333,15 +348,16 @@ def query_rag(query_text: str, use_guard: bool = True, use_prompt_guard: bool = 
         return response
     
     # Use filtered results
-    results = filtered_results
+    # results = filtered_results
     
     # Display retrieved sources
-    print(f"   ✅ Found {len(results)} relevant sections")
-    for i, (doc, score) in enumerate(results[:3], 1):
+    print(f"   ✅ Found {len(filtered_results)} relevant sections")
+    for i, (doc, score) in enumerate(filtered_results[:5], 1):
         source = doc.metadata.get("id", "Unknown")
         print(f"   {i}. {source} (relevance: {1-score:.2f})")
 
     # Display retrieved chunks
+    #TODO: Replace with function to print top chunks
     print("\n📄 Retrieved Context Chunks:")
     print("-" * 60)
     for i, (doc, score) in enumerate(results, 1):
@@ -361,7 +377,7 @@ def query_rag(query_text: str, use_guard: bool = True, use_prompt_guard: bool = 
     # ============================================================
     print("\n🤖 [Layer 4] Generating response from context...")
     
-    context_text = "\n\n---\n\n".join([doc.page_content for doc, _score in results])
+    context_text = "\n\n---\n\n".join([doc.page_content for doc, _score in filtered_results])
     prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
     prompt = prompt_template.format(context=context_text, question=query_text)
     
@@ -381,7 +397,7 @@ def query_rag(query_text: str, use_guard: bool = True, use_prompt_guard: bool = 
             query=query_text,
             response=response_text,
             context=context_text,
-            retrieved_chunks=results
+            retrieved_chunks=filtered_results
         )
         
         print(f"\n   📊 Validation Results:")
